@@ -1,3 +1,4 @@
+import re
 from typing import Any, Dict, List, Optional
 from odoo_mcp.core.client import OdooClient
 from odoo_mcp.security.guards import guard_model_access, guard_write_fields
@@ -122,18 +123,99 @@ def odoo_search_read(
     domain: List[Any],
     fields: Optional[List[str]] = None,
     limit: int = 80,
+    offset: int = 0,
 ) -> List[Dict[str, Any]]:
     """Search and read in a single call."""
     validate_domain(domain)
     guard_model_access(model, client, sender_id=user_id)
     clean = _validate_fields(client, model, fields, user_id)
     kwargs = {"limit": limit}
+    if offset:
+        kwargs["offset"] = max(int(offset), 0)
     if clean:
         kwargs["fields"] = clean
     records = client.call_kw(
         model, "search_read", args=[domain], kwargs=kwargs, sender_id=user_id
     )
     return serialize_records(records, model=model, base_url=client.odoo_session.url)
+
+
+_READ_GROUP_AGGREGATORS = {"sum", "avg", "min", "max", "count", "count_distinct"}
+_READ_GROUP_GRANULARITIES = {"day", "week", "month", "quarter", "year"}
+_READ_GROUP_ORDER_TERM = re.compile(r"^[\w.]+(:\w+)?(\s+(asc|desc))?$", re.IGNORECASE)
+
+
+def _normalize_orderby(orderby: Optional[str]) -> Optional[str]:
+    """Strip stray quotes LLMs tend to add and validate ``field[:gran] [asc|desc]``."""
+    if not orderby:
+        return None
+    terms = [t.strip().strip("\"'").strip() for t in orderby.strip().strip("\"'").split(",")]
+    terms = [t for t in terms if t]
+    for term in terms:
+        if not _READ_GROUP_ORDER_TERM.match(term):
+            raise OdooRPCError(
+                f"invalid orderby term {term!r}; expected e.g. "
+                "'invoice_date:month asc' or 'amount_total_signed:sum desc'"
+            )
+    return ", ".join(terms) or None
+
+
+def _split_spec(spec: str, allowed: set, kind: str) -> str:
+    """Return the field name of ``field[:suffix]`` after checking the suffix."""
+    if not isinstance(spec, str) or not spec:
+        raise OdooRPCError(f"invalid {kind} spec: {spec!r}")
+    name, _, suffix = spec.partition(":")
+    if suffix and suffix not in allowed:
+        raise OdooRPCError(
+            f"invalid {kind} '{suffix}' in {spec!r}; allowed: {sorted(allowed)}"
+        )
+    return name
+
+
+def odoo_read_group(
+    client: OdooClient,
+    user_id: int,
+    model: str,
+    domain: List[Any],
+    fields: List[str],
+    groupby: Optional[List[str]] = None,
+    limit: Optional[int] = None,
+    orderby: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Aggregate records server side (totals, counts, averages) with read_group.
+
+    ``fields`` uses Odoo's ``field:aggregator`` syntax (e.g.
+    ``amount_total_signed:sum``) and ``groupby`` accepts ``field`` or
+    ``date_field:granularity`` (e.g. ``invoice_date:month``). With an empty
+    ``groupby`` a single row with the grand totals is returned.
+    """
+    validate_domain(domain)
+    guard_model_access(model, client, sender_id=user_id)
+    if not fields:
+        raise OdooRPCError("fields is required, e.g. ['amount_total_signed:sum']")
+    groupby = groupby or []
+    field_names = [_split_spec(f, _READ_GROUP_AGGREGATORS, "aggregator") for f in fields]
+    group_names = [_split_spec(g, _READ_GROUP_GRANULARITIES, "granularity") for g in groupby]
+    _validate_fields(client, model, field_names + group_names, user_id)
+
+    kwargs: Dict[str, Any] = {"lazy": False}
+    if limit:
+        kwargs["limit"] = int(limit)
+    orderby = _normalize_orderby(orderby)
+    if orderby:
+        kwargs["orderby"] = orderby
+    groups = client.call_kw(
+        model,
+        "read_group",
+        args=[domain, fields, groupby],
+        kwargs=kwargs,
+        sender_id=user_id,
+    )
+    # __domain/__context are only useful to the web client and bloat the answer
+    return [
+        {k: v for k, v in group.items() if k not in ("__domain", "__context")}
+        for group in groups or []
+    ]
 
 
 def list_installed_modules(

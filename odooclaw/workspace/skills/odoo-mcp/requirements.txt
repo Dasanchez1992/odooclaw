@@ -6,6 +6,8 @@ langchain-core
 langchain-openai
 langgraph
 mcp-server>=0.1.0
+# odoo_mcp uses mcp.server.fastmcp, removed in mcp 2.x
+mcp>=1.2,<2
 numpy
 numpy-financial==1.0.0
 openpyxl

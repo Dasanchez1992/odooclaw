@@ -413,7 +413,11 @@ def odoo_search_read(
     limit: int = DEFAULT_SEARCH_LIMIT,
     fields: list[str] | None = None,
     sender_id: int | None = None,
+    offset: int = 0,
 ) -> list:
+    """Search records and read their fields. Use ``offset`` to page through
+    results longer than ``limit``. To compute totals, counts or averages use
+    ``odoo_read_group`` instead of reading every record."""
     with measure_time("odoo_search_read"):
         client = get_odoo_client()
         return records.odoo_search_read(
@@ -423,6 +427,48 @@ def odoo_search_read(
             domain or [],
             fields,
             limit,
+            offset,
+        )
+
+
+@mcp.tool()
+def odoo_read_group(
+    model: str,
+    fields: list[str],
+    domain: list | None = None,
+    groupby: list[str] | None = None,
+    limit: int | None = None,
+    orderby: str | None = None,
+    sender_id: int | None = None,
+) -> list:
+    """Aggregate records in Odoo (sum, count, average...) without reading them
+    one by one. Use it for any total, report or "how many / how much" question
+    over a period or a large set of records.
+
+    - fields: "field:aggregator", aggregator in sum, avg, min, max, count,
+      count_distinct. Add "__count" to get the number of records per group.
+    - groupby: field names, dates as "field:granularity" (day, week, month,
+      quarter, year). Empty -> one row with the grand totals.
+    - orderby: e.g. "amount_total_signed desc".
+
+    Example, customer invoices of August 2026 per month:
+      model="account.move",
+      domain=[["move_type","=","out_invoice"],["state","=","posted"],
+              ["invoice_date",">=","2026-08-01"],["invoice_date","<=","2026-08-31"]],
+      fields=["amount_untaxed_signed:sum","amount_total_signed:sum","__count"],
+      groupby=["invoice_date:month"]
+    """
+    with measure_time("odoo_read_group"):
+        client = get_odoo_client()
+        return records.odoo_read_group(
+            client,
+            sender_id or client.odoo_session.get_uid(),
+            model,
+            domain or [],
+            fields,
+            groupby,
+            limit,
+            orderby,
         )
 
 
@@ -524,16 +570,18 @@ def odoo_find_partner(
     vat: str | None = None,
     email: str | None = None,
     sender_id: int | None = None,
-) -> int:
+) -> dict:
+    """Find one partner by VAT/identification (exact), email (exact) or full
+    name, in that order. Returns id, name, vat and email so you can confirm it
+    is the right contact before using its id in other filters."""
     with measure_time("odoo_find_partner"):
         client = get_odoo_client()
-        return partners.odoo_find_partner(
-            client,
-            sender_id or client.odoo_session.get_uid(),
-            name,
-            vat,
-            email,
+        user_id = sender_id or client.odoo_session.get_uid()
+        partner_id = partners.odoo_find_partner(client, user_id, name, vat, email)
+        found = records.odoo_read(
+            client, user_id, "res.partner", [partner_id], ["name", "vat", "email"]
         )
+        return found[0] if found else {"id": partner_id}
 
 
 @mcp.tool()
