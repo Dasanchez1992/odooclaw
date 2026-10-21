@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -169,6 +170,13 @@ func (c *OdooChannel) Send(ctx context.Context, msg bus.OutboundMessage) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
+	// Odoo 16+ ignores ?db= on custom routes, so a cookie-less request to a
+	// multi-database server gets a 404. OCA dbfilter_from_header selects the
+	// database from this header instead.
+	if db := resolveReplyDB(c.config.TargetDB, os.Getenv("ODOO_DB")); db != "" {
+		req.Header.Set("X-Odoo-dbfilter", buildDBFilterHeader(db))
+	}
+
 	if token := os.Getenv("ODOOCLAW_REPLY_TOKEN"); token != "" {
 		req.Header.Set("X-OdooClaw-Token", token)
 	}
@@ -192,16 +200,24 @@ func (c *OdooChannel) Send(ctx context.Context, msg bus.OutboundMessage) error {
 func buildReplyEndpoint(odooURL, targetDB, fallbackEnvDB string) string {
 	endpoint := fmt.Sprintf("%s/odooclaw/reply", strings.TrimSuffix(odooURL, "/"))
 
-	resolvedDB := strings.TrimSpace(targetDB)
-	if resolvedDB == "" {
-		resolvedDB = strings.TrimSpace(fallbackEnvDB)
-	}
-
-	if resolvedDB != "" {
+	if resolvedDB := resolveReplyDB(targetDB, fallbackEnvDB); resolvedDB != "" {
 		endpoint = fmt.Sprintf("%s?db=%s", endpoint, resolvedDB)
 	}
 
 	return endpoint
+}
+
+func resolveReplyDB(targetDB, fallbackEnvDB string) string {
+	if db := strings.TrimSpace(targetDB); db != "" {
+		return db
+	}
+	return strings.TrimSpace(fallbackEnvDB)
+}
+
+// buildDBFilterHeader returns an anchored regex matching only db, so Odoo
+// (Python re.match) cannot select another database sharing its prefix.
+func buildDBFilterHeader(db string) string {
+	return "^" + regexp.QuoteMeta(db) + "$"
 }
 
 func (c *OdooChannel) WebhookPath() string {

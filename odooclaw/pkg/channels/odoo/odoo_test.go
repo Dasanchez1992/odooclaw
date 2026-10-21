@@ -165,6 +165,92 @@ func TestBuildReplyEndpoint_NoDB(t *testing.T) {
 	}
 }
 
+func TestBuildDBFilterHeader_AnchorsAndEscapes(t *testing.T) {
+	got := buildDBFilterHeader("odoo18.prod")
+	want := `^odoo18\.prod$`
+	if got != want {
+		t.Fatalf("buildDBFilterHeader() = %q, want %q", got, want)
+	}
+}
+
+// capturedReply holds what a fake Odoo received on /odooclaw/reply.
+type capturedReply struct {
+	path     string
+	query    string
+	dbFilter string
+	hasDBHdr bool
+	payload  OdooReplyPayload
+}
+
+func sendToFakeOdoo(t *testing.T, cfg config.OdooConfig, envDB string) capturedReply {
+	t.Helper()
+	var got capturedReply
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got.path = r.URL.Path
+		got.query = r.URL.RawQuery
+		_, got.hasDBHdr = r.Header["X-Odoo-Dbfilter"]
+		got.dbFilter = r.Header.Get("X-Odoo-dbfilter")
+		if err := json.NewDecoder(r.Body).Decode(&got.payload); err != nil {
+			t.Errorf("decode reply payload: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	t.Setenv("ODOO_URL", server.URL)
+	t.Setenv("ODOO_DB", envDB)
+	t.Setenv("ODOOCLAW_REPLY_TOKEN", "")
+
+	channel, err := NewOdooChannel(cfg, bus.NewMessageBus(), t.TempDir())
+	if err != nil {
+		t.Fatalf("NewOdooChannel() error = %v", err)
+	}
+	channel.pendingTokens.Store("discuss.channel_4", "tok-4")
+
+	msg := bus.OutboundMessage{Channel: "odoo", ChatID: "discuss.channel_4", Content: "hola"}
+	if err := channel.Send(context.Background(), msg); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+	return got
+}
+
+func TestSend_SetsDBFilterHeaderFromTargetDB(t *testing.T) {
+	got := sendToFakeOdoo(t, config.OdooConfig{TargetDB: "odoo18-test"}, "otherdb")
+
+	if got.path != "/odooclaw/reply" {
+		t.Fatalf("path = %q, want %q", got.path, "/odooclaw/reply")
+	}
+	if got.query != "db=odoo18-test" {
+		t.Fatalf("query = %q, want %q", got.query, "db=odoo18-test")
+	}
+	if got.dbFilter != "^odoo18-test$" {
+		t.Fatalf("X-Odoo-dbfilter = %q, want %q", got.dbFilter, "^odoo18-test$")
+	}
+	want := OdooReplyPayload{Model: "discuss.channel", ResID: 4, Message: "hola", ReplyToken: "tok-4"}
+	if got.payload != want {
+		t.Fatalf("payload = %+v, want %+v", got.payload, want)
+	}
+}
+
+func TestSend_SetsDBFilterHeaderFromEnvDB(t *testing.T) {
+	got := sendToFakeOdoo(t, config.OdooConfig{}, "devel")
+
+	if got.dbFilter != "^devel$" {
+		t.Fatalf("X-Odoo-dbfilter = %q, want %q", got.dbFilter, "^devel$")
+	}
+}
+
+func TestSend_NoDBFilterHeaderWithoutDB(t *testing.T) {
+	got := sendToFakeOdoo(t, config.OdooConfig{}, "")
+
+	if got.hasDBHdr {
+		t.Fatalf("X-Odoo-dbfilter = %q, want header absent", got.dbFilter)
+	}
+	if got.query != "" {
+		t.Fatalf("query = %q, want empty", got.query)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // System webhook: POST /webhook/odoo/system
 // ---------------------------------------------------------------------------
