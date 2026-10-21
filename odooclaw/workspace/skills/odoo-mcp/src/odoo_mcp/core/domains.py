@@ -1,3 +1,4 @@
+import html
 from typing import Any, List
 from odoo_mcp.core.exceptions import OdooSecurityError
 
@@ -25,6 +26,11 @@ def validate_domain(domain: List[Any]) -> None:
             if len(term) != 3:
                 raise OdooSecurityError(f"Domain leaf must have exactly 3 elements: {term}")
             _, op, _ = term
+            if isinstance(op, str) and "&" in op:
+                # Models echo Odoo's HTML chat and send "&gt;=" for ">=".
+                op = html.unescape(op)
+                if isinstance(term, list):
+                    term[1] = op
             if op not in SUPPORTED_OPERATORS:
                 raise OdooSecurityError(f"Unsupported domain operator: {op}")
         else:

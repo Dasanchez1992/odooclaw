@@ -94,6 +94,17 @@ class OdooClient:
             response = self.odoo_session.session.post(
                 endpoint, json=payload, timeout=30
             )
+            if response.status_code >= 400:
+                # call_kw_as_user answers errors as {"status": "error", "reason": ...};
+                # surface the reason so the agent can correct its call.
+                try:
+                    reason = response.json().get("reason")
+                except ValueError:
+                    reason = None
+                if reason:
+                    raise OdooRPCError(
+                        f"Delegated RPC Error ({response.status_code}): {reason}"
+                    )
             response.raise_for_status()
             result = response.json()
 

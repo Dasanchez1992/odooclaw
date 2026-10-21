@@ -2203,10 +2203,14 @@ func (al *AgentLoop) summarizeSession(agent *AgentInstance, sessionKey string) {
 	omitted := false
 
 	for _, m := range toSummarize {
-		if m.Role != "user" && m.Role != "assistant" {
+		if m.Role != "user" && m.Role != "assistant" && m.Role != "tool" {
 			continue
 		}
+		// Tool results are truncated when rendered, so they never trip the guard.
 		msgTokens := len(m.Content) / 2
+		if m.Role == "tool" {
+			msgTokens = 0
+		}
 		if msgTokens > maxMessageTokens {
 			omitted = true
 			continue
@@ -2264,6 +2268,55 @@ func (al *AgentLoop) summarizeSession(agent *AgentInstance, sessionKey string) {
 	}
 }
 
+const (
+	summaryToolArgsMaxChars   = 600
+	summaryToolResultMaxChars = 800
+)
+
+// formatMessageForSummary renders one history message for the summarizer.
+// Assistant tool calls carry no Content — their name and arguments live in
+// ToolCalls — so printing only Content made the summarizer believe the calls
+// were sent without arguments and write that into the persisted summary.
+func formatMessageForSummary(m providers.Message) string {
+	var sb strings.Builder
+	switch m.Role {
+	case "tool":
+		fmt.Fprintf(&sb, "[tool result] %s\n", truncateForSummary(m.Content, summaryToolResultMaxChars))
+		return sb.String()
+	case "assistant":
+		if strings.TrimSpace(m.Content) != "" {
+			fmt.Fprintf(&sb, "assistant: %s\n", m.Content)
+		}
+		for _, tc := range m.ToolCalls {
+			name, args := tc.Name, ""
+			if tc.Function != nil {
+				if tc.Function.Name != "" {
+					name = tc.Function.Name
+				}
+				args = tc.Function.Arguments
+			}
+			if args == "" && len(tc.Arguments) > 0 {
+				if b, err := json.Marshal(tc.Arguments); err == nil {
+					args = string(b)
+				}
+			}
+			fmt.Fprintf(&sb, "[tool call] %s(%s)\n", name, truncateForSummary(args, summaryToolArgsMaxChars))
+		}
+		return sb.String()
+	default:
+		fmt.Fprintf(&sb, "%s: %s\n", m.Role, m.Content)
+		return sb.String()
+	}
+}
+
+func truncateForSummary(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max]) + "…[truncated]"
+}
+
 // summarizeBatch summarizes a batch of messages.
 func (al *AgentLoop) summarizeBatch(
 	ctx context.Context,
@@ -2275,6 +2328,11 @@ func (al *AgentLoop) summarizeBatch(
 	sb.WriteString(
 		"Provide a concise summary of this conversation segment, preserving core context and key points.\n",
 	)
+	sb.WriteString(
+		"Tool calls appear as [tool call] lines with their exact arguments and [tool result] lines with " +
+			"(possibly truncated) output. Report filters and figures as they appear there; never claim a " +
+			"call was sent without arguments when its arguments are shown.\n",
+	)
 	if existingSummary != "" {
 		sb.WriteString("Existing context: ")
 		sb.WriteString(existingSummary)
@@ -2282,7 +2340,7 @@ func (al *AgentLoop) summarizeBatch(
 	}
 	sb.WriteString("\nCONVERSATION:\n")
 	for _, m := range batch {
-		fmt.Fprintf(&sb, "%s: %s\n", m.Role, m.Content)
+		sb.WriteString(formatMessageForSummary(m))
 	}
 	prompt := sb.String()
 
@@ -2472,6 +2530,28 @@ func lastUserMessageText(messages []providers.Message) string {
 		}
 	}
 	return ""
+}
+
+// pinnedToolSuffixes are generic Odoo query tools that must always reach a
+// cloud-sized tool set: keyword scoring cannot anticipate every question, and
+// without them the model has no fallback for ad-hoc filters or aggregations
+// (e.g. "ventas agrupadas por mes"). MCP tool names carry a server prefix
+// (mcp_odoo-manager_odoo_read_group), so they are matched by suffix.
+var pinnedToolSuffixes = []string{
+	"odoo_read_group",
+	"odoo_search_read",
+	"odoo_model_schema",
+}
+
+const pinnedToolBoost = 1000
+
+func isPinnedTool(name string) bool {
+	for _, suffix := range pinnedToolSuffixes {
+		if strings.HasSuffix(name, suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 // retrieveRelevantTools selects the top-K tool definitions most relevant to the
@@ -2789,7 +2869,11 @@ func retrieveRelevantTools(defs []providers.ToolDefinition, query string, k int)
 	}
 	scoredDefs := make([]scored, 0, len(defs))
 	for _, d := range defs {
-		scoredDefs = append(scoredDefs, scored{def: d, s: score(d.Function.Name)})
+		s := score(d.Function.Name)
+		if k > maxLocalToolsInPrompt && isPinnedTool(d.Function.Name) {
+			s += pinnedToolBoost
+		}
+		scoredDefs = append(scoredDefs, scored{def: d, s: s})
 	}
 	// Stable sort by score desc
 	sort.SliceStable(scoredDefs, func(i, j int) bool { return scoredDefs[i].s > scoredDefs[j].s })

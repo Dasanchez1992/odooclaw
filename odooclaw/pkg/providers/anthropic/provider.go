@@ -166,10 +166,7 @@ func buildParams(
 						log.Printf("anthropic: skipping tool call with empty name (id=%q)", tc.ID)
 						continue
 					}
-					args := tc.Arguments
-					if args == nil {
-						args = map[string]any{}
-					}
+					args := toolCallArguments(tc)
 					blocks = append(blocks, anthropic.NewToolUseBlock(tc.ID, args, name))
 					if tc.ID != "" {
 						validToolCallIDs[tc.ID] = struct{}{}
@@ -210,7 +207,7 @@ func buildParams(
 		params.System = system
 	}
 
-	if temp, ok := options["temperature"].(float64); ok {
+	if temp, ok := options["temperature"].(float64); ok && supportsTemperature(model) {
 		params.Temperature = anthropic.Float(temp)
 	}
 
@@ -219,6 +216,44 @@ func buildParams(
 	}
 
 	return params, nil
+}
+
+// toolCallArguments returns the input of a past tool call. The agent loop
+// stores history tool calls with the arguments only as JSON text in
+// Function.Arguments (Arguments is json:"-" and never set there); reading only
+// tc.Arguments replayed every previous call to Claude as `input: {}`, so the
+// model believed its calls had been sent without parameters and retried them.
+func toolCallArguments(tc protocoltypes.ToolCall) map[string]any {
+	if len(tc.Arguments) > 0 {
+		return tc.Arguments
+	}
+	if tc.Function != nil && strings.TrimSpace(tc.Function.Arguments) != "" {
+		var args map[string]any
+		if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err == nil && args != nil {
+			return args
+		}
+		log.Printf("anthropic: could not decode arguments of tool call %q", tc.ID)
+	}
+	return map[string]any{}
+}
+
+// supportsTemperature reports whether the model still accepts the temperature
+// parameter. Claude 5 and later reject it with "`temperature` is deprecated
+// for this model", so only legacy families receive it.
+func supportsTemperature(model string) bool {
+	m := strings.ToLower(model)
+	if i := strings.LastIndex(m, "/"); i >= 0 {
+		m = m[i+1:]
+	}
+	for _, prefix := range []string{
+		"claude-2", "claude-instant", "claude-3",
+		"claude-opus-4", "claude-sonnet-4", "claude-haiku-4",
+	} {
+		if strings.HasPrefix(m, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func trimMessagesForAnthropic(messages []Message, maxNonSystem int) []Message {

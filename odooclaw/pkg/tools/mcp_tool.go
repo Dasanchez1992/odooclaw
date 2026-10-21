@@ -233,8 +233,7 @@ func (t *MCPTool) Execute(ctx context.Context, args map[string]any) *ToolResult 
 			WithError(fmt.Errorf("MCP tool error: %s", errMsg))
 	}
 
-	// Extract text content from result
-	output := extractContentText(result.Content)
+	output := mcpOutputForLLM(result)
 
 	return &ToolResult{
 		ForLLM:  output,
@@ -378,6 +377,25 @@ func parseCompanyIDs(raw string) []int {
 }
 
 // extractContentText extracts text from MCP content array
+// emptyMCPResultForLLM is sent when a successful call returns no content.
+// FastMCP encodes an empty list as zero content items; passing "" on made the
+// model believe the call failed or was sent without arguments, and it retried
+// the same call in a loop.
+const emptyMCPResultForLLM = "[] (the tool ran successfully with the given arguments: 0 records matched)"
+
+// mcpOutputForLLM renders a successful MCP result as text for the model.
+func mcpOutputForLLM(result *mcp.CallToolResult) string {
+	if output := extractContentText(result.Content); strings.TrimSpace(output) != "" {
+		return output
+	}
+	if result.StructuredContent != nil {
+		if b, err := json.Marshal(result.StructuredContent); err == nil && len(b) > 0 && string(b) != "null" {
+			return string(b)
+		}
+	}
+	return emptyMCPResultForLLM
+}
+
 func extractContentText(content []mcp.Content) string {
 	var parts []string
 	for _, c := range content {

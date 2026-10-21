@@ -184,10 +184,15 @@ def get_partner_summary(client: OdooClient, user_id: int, partner_id: int) -> di
         client,
         user_id,
         "account.move",
-        [
-            ("partner_id", "=", partner_id),
-            ("state", "=", "posted"),
-            ("payment_state", "in", ["not_paid", "partial"]),
+        "search_count",
+        args=[
+            [
+                ("partner_id", "=", partner_id),
+                # journal entries (POS/payments) are always "not_paid": count invoices only
+                ("move_type", "in", ["out_invoice", "out_refund"]),
+                ("state", "=", "posted"),
+                ("payment_state", "in", ["not_paid", "partial"]),
+            ]
         ],
     )
     return summary
